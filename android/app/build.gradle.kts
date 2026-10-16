@@ -96,11 +96,14 @@ android {
         val tvAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         create("mobile") {
             dimension = "device"
-            applicationId = baseAppId
+            // Use the same opt-in suffix supported by Android TV, allowing a
+            // debug download-fix build to coexist with a release installation.
+            applicationId = baseAppId + testIdSuffix
             versionCode = flutter.versionCode
             versionName = flutter.versionName
             ndk { abiFilters += mobileAbis }
-            manifestPlaceholders["appName"] = baseAppName
+            manifestPlaceholders["appName"] =
+                if (testIdSuffix.isEmpty()) baseAppName else "$baseAppName Test"
         }
         create("mobile-beta") {
             dimension = "device"
