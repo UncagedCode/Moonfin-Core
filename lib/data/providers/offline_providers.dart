@@ -56,6 +56,21 @@ final downloadedCatalogProvider = StreamProvider<DownloadCatalog>((ref) {
   return _repo.watchItems(onlyCompleted: true).map(partitionDownloadCatalog);
 });
 
+/// Failed transfers remain visible after restart, independently of the
+/// completed-file catalog. Do not include Series/Season artwork-only rows.
+List<DownloadedItem> filterFailedDownloads(List<DownloadedItem> rows) {
+  final failed = rows.where(
+    (row) =>
+        row.downloadStatus == 3 && downloadableItemTypes.contains(row.type),
+  ).toList();
+  failed.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+  return failed;
+}
+
+final failedDownloadsProvider = StreamProvider<List<DownloadedItem>>((ref) {
+  return _repo.watchItems().map(filterFailedDownloads);
+});
+
 final downloadedMoviesProvider = StreamProvider<List<DownloadedItem>>((ref) {
   return _repo.watchItems(type: 'Movie', onlyCompleted: true);
 });
