@@ -2587,8 +2587,10 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
             // Android muxer even when Emby can stream H.264 HLS. Retry once
             // with Emby's own playback URL rather than downloading 4K source.
             // Don't retry a server/network error or an explicit cancellation.
+            final nativeError = firstError.error;
             if (_client.serverType != ServerType.emby ||
-                firstError.error is! TransmuxFailedException ||
+                nativeError is! TransmuxFailedException ||
+                !nativeError.isMuxerFailure ||
                 cancelToken.isCancelled) {
               rethrow;
             }
