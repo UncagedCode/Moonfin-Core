@@ -35,6 +35,7 @@ import 'book_reader_service.dart';
 import 'download_notification_service.dart';
 import 'legacy_download_engine.dart';
 import 'media3_transmux_downloader.dart';
+import 'emby_hls_download_fallback.dart';
 import 'media_store_service.dart';
 import 'storage_path_service.dart';
 import 'web_download_helper.dart';
@@ -1434,6 +1435,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
         type: DioExceptionType.unknown,
         requestOptions: RequestOptions(path: url),
         message: friendlyDownloadFailure(e.message),
+        error: e,
       );
     }
   }
@@ -2164,6 +2166,28 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
     return '$baseUrl/Videos/$itemId/stream?$query';
   }
 
+  /// Ask Emby for the same H.264/AAC HLS offer used for ordinary playback.
+  /// The server supplies the actual playlist URL and audio-track parameters.
+  /// This is only attempted after an Android Media3 transcode export fails.
+  Future<String?> _embyHlsDownloadUrl(
+    AggregatedItem item,
+    DownloadQuality quality,
+  ) async {
+    final playbackInfo = await _client.playbackApi.getPlaybackInfo(
+      item.id,
+      userId: _client.userId,
+      requestBody: EmbyHlsDownloadFallback.playbackRequest(
+        quality: quality,
+        userId: _client.userId,
+      ),
+    );
+    return EmbyHlsDownloadFallback.streamUrl(
+      playbackInfo,
+      baseUrl: _client.baseUrl,
+      quality: quality,
+    );
+  }
+
   Future<AggregatedItem> _ensureFullItem(AggregatedItem item) async {
     // Items from row queries are missing fields like Overview and Chapters,
     // so always fetch the full item before persisting its metadata. This copy
@@ -2558,6 +2582,39 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
               cancelToken: cancelToken,
               onReceiveProgress: onReceiveProgress,
             );
+          } on DioException catch (firstError) {
+            // The ordinary HEVC fragmented-MP4 path can fail inside the
+            // Android muxer even when Emby can stream H.264 HLS. Retry once
+            // with Emby's own playback URL rather than downloading 4K source.
+            // Don't retry a server/network error or an explicit cancellation.
+            if (_client.serverType != ServerType.emby ||
+                firstError.error is! TransmuxFailedException ||
+                cancelToken.isCancelled) {
+              rethrow;
+            }
+            String? hlsUrl;
+            try {
+              hlsUrl = await _embyHlsDownloadUrl(fullItem, quality);
+            } catch (e) {
+              // Avoid logging server URLs or tokens from a playback error.
+              debugPrint('Emby HLS download fallback unavailable: ${e.runtimeType}');
+            }
+            if (hlsUrl == null) rethrow;
+            final partial = File(savePath!);
+            if (await partial.exists()) await partial.delete();
+            debugPrint('Retrying failed Android transmux with Emby HLS');
+            try {
+              return await _downloadWithTransmux(
+                hlsUrl,
+                itemId: item.id,
+                savePath: savePath!,
+                headers: headers,
+                cancelToken: cancelToken,
+                onReceiveProgress: onReceiveProgress,
+              );
+            } on TransmuxUnavailableException {
+              throw firstError;
+            }
           } on TransmuxUnavailableException {
             // The native side refused this one (busy, missing, or an old
             // device). The regular engines still produce a playable file.
