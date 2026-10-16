@@ -620,6 +620,12 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
           quality: queued.quality,
         );
         _emitError('${queued.item.name}: ${error.toString()}');
+        await _persistFailedDownload(
+          queued.item,
+          queued.quality,
+          queued.source,
+          error.toString(),
+        );
         notifyListeners();
       }
       if (!queued.completer.isCompleted) {
@@ -781,6 +787,86 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
 
   StoragePathService get _storagePath => GetIt.instance<StoragePathService>();
   OfflineRepository get _offlineRepo => GetIt.instance<OfflineRepository>();
+
+  /// Records a failed attempt even if it stopped before the normal
+  /// downloading row was created (Wi-Fi policy, storage check, item lookup).
+  /// Completed downloads are never overwritten by an early failure.
+  Future<void> _persistFailedDownload(
+    AggregatedItem item,
+    DownloadQuality quality,
+    DownloadSource source,
+    String reason,
+  ) async {
+    final existing = await _offlineRepo.getItem(item.id);
+    if (existing?.downloadStatus == 2) return;
+    if (existing == null) {
+      await _offlineRepo.upsertItem(
+        DownloadedItemsCompanion(
+          itemId: Value(item.id),
+          serverId: Value(item.serverId),
+          type: Value(item.type ?? 'Unknown'),
+          name: Value(item.name),
+          metadataJson: Value(jsonEncode(item.rawData)),
+          downloadStatus: const Value(3),
+          errorMessage: Value(reason),
+          qualityPreset: Value(quality.name),
+          downloadSource: Value(source.name),
+          seriesId: Value(item.seriesId),
+          seasonId: Value(item.seasonId),
+          seriesName: Value(item.seriesName),
+          seasonName: Value(item.rawData['SeasonName'] as String?),
+          indexNumber: Value(item.indexNumber),
+          parentIndexNumber: Value(item.parentIndexNumber),
+        ),
+      );
+    } else {
+      await _offlineRepo.updateDownloadStatus(item.id, 3, error: reason);
+    }
+  }
+
+  /// A retry re-queues the original quality with the usual permissions and
+  /// storage checks. It starts asynchronously, just like tapping Download
+  /// from a title detail page, without blocking the Failed tab for hours.
+  Future<void> retryFailedDownload(DownloadedItem failed) async {
+    final latest = await _offlineRepo.getItem(failed.itemId);
+    if (latest == null ||
+        latest.downloadStatus != 3 ||
+        latest.serverId != failed.serverId) {
+      return;
+    }
+    final progress = _activeDownloads[latest.itemId];
+    if (progress != null && progress.isInFlight) return;
+    unawaited(
+      downloadItem(
+        AggregatedItem(
+          id: latest.itemId,
+          serverId: latest.serverId,
+          rawData: _offlineRepo.rowToRawData(latest),
+        ),
+        quality: DownloadQuality.fromName(latest.qualityPreset),
+        source: DownloadSource.manual,
+      ).catchError((Object error, StackTrace stackTrace) {
+        debugPrint('[DownloadService] Retry failed: ${error.runtimeType}');
+      }),
+    );
+  }
+
+  /// Remove the failure record only. A failed attempt may share a film folder
+  /// with valid downloads, so never recursively delete a media directory.
+  Future<void> removeFailedDownload(DownloadedItem failed) async {
+    final latest = await _offlineRepo.getItem(failed.itemId);
+    if (latest == null ||
+        latest.downloadStatus != 3 ||
+        latest.serverId != failed.serverId) {
+      return;
+    }
+    final progress = _activeDownloads[latest.itemId];
+    if (progress != null && progress.isInFlight) return;
+    await _offlineRepo.deleteItem(latest.itemId);
+    _activeDownloads.remove(latest.itemId);
+    _sources.remove(latest.itemId);
+    notifyListeners();
+  }
 
   String _fileNameBaseFromPath(String savePath) {
     return p.basenameWithoutExtension(savePath);
@@ -2330,6 +2416,10 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
     var activityResumeTicks = 0;
 
     if (!await _checkWifiPolicy()) {
+      await _persistFailedDownload(
+        item, quality, source,
+        'WiFi-only mode enabled. Connect to WiFi to download.',
+      );
       _activeDownloads[item.id] = DownloadProgress(
         itemId: item.id,
         fileName: item.name,
@@ -2350,6 +2440,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
       final estimatedSize = estimateDownloadSizeBytes(fullItem, quality);
       final refusal = await _storageRefusal(estimatedSize);
       if (refusal != null) {
+        await _persistFailedDownload(fullItem, quality, source, refusal);
         _activeDownloads[item.id] = DownloadProgress(
           itemId: item.id,
           fileName: item.name,
@@ -2373,6 +2464,9 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
               'Not enough free space in ${downloadsDir.path}. '
               'Needs about ${formatBytes(estimatedSize + _freeSpaceHeadroomBytes)}, '
               '${formatBytes(free)} available.';
+          await _persistFailedDownload(
+            fullItem, quality, source, message,
+          );
           _activeDownloads[item.id] = DownloadProgress(
             itemId: item.id,
             fileName: item.name,
@@ -2778,11 +2872,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
           error: friendlyError,
           quality: quality,
         );
-        await _offlineRepo.updateDownloadStatus(
-          item.id,
-          3,
-          error: friendlyError,
-        );
+        await _persistFailedDownload(item, quality, source, friendlyError);
         if (!pluginOwnsNotifications()) {
           await _notifyDownloadError(item.name, friendlyError);
         }
@@ -2799,7 +2889,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
         error: friendlyError,
         quality: quality,
       );
-      await _offlineRepo.updateDownloadStatus(item.id, 3, error: friendlyError);
+      await _persistFailedDownload(item, quality, source, friendlyError);
       if (!pluginOwnsNotifications()) {
         await _notifyDownloadError(item.name, friendlyError);
       }
@@ -2819,7 +2909,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
         error: friendlyError,
         quality: quality,
       );
-      await _offlineRepo.updateDownloadStatus(item.id, 3, error: friendlyError);
+      await _persistFailedDownload(item, quality, source, friendlyError);
       if (!pluginOwnsNotifications()) {
         await _notifyDownloadError(item.name, friendlyError);
       }
