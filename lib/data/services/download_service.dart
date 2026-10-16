@@ -35,6 +35,7 @@ import 'book_reader_service.dart';
 import 'download_notification_service.dart';
 import 'legacy_download_engine.dart';
 import 'media3_transmux_downloader.dart';
+import 'emby_hls_download_fallback.dart';
 import 'media_store_service.dart';
 import 'storage_path_service.dart';
 import 'web_download_helper.dart';
@@ -619,6 +620,12 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
           quality: queued.quality,
         );
         _emitError('${queued.item.name}: ${error.toString()}');
+        await _persistFailedDownload(
+          queued.item,
+          queued.quality,
+          queued.source,
+          error.toString(),
+        );
         notifyListeners();
       }
       if (!queued.completer.isCompleted) {
@@ -780,6 +787,86 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
 
   StoragePathService get _storagePath => GetIt.instance<StoragePathService>();
   OfflineRepository get _offlineRepo => GetIt.instance<OfflineRepository>();
+
+  /// Records a failed attempt even if it stopped before the normal
+  /// downloading row was created (Wi-Fi policy, storage check, item lookup).
+  /// Completed downloads are never overwritten by an early failure.
+  Future<void> _persistFailedDownload(
+    AggregatedItem item,
+    DownloadQuality quality,
+    DownloadSource source,
+    String reason,
+  ) async {
+    final existing = await _offlineRepo.getItem(item.id);
+    if (existing?.downloadStatus == 2) return;
+    if (existing == null) {
+      await _offlineRepo.upsertItem(
+        DownloadedItemsCompanion(
+          itemId: Value(item.id),
+          serverId: Value(item.serverId),
+          type: Value(item.type ?? 'Unknown'),
+          name: Value(item.name),
+          metadataJson: Value(jsonEncode(item.rawData)),
+          downloadStatus: const Value(3),
+          errorMessage: Value(reason),
+          qualityPreset: Value(quality.name),
+          downloadSource: Value(source.name),
+          seriesId: Value(item.seriesId),
+          seasonId: Value(item.seasonId),
+          seriesName: Value(item.seriesName),
+          seasonName: Value(item.rawData['SeasonName'] as String?),
+          indexNumber: Value(item.indexNumber),
+          parentIndexNumber: Value(item.parentIndexNumber),
+        ),
+      );
+    } else {
+      await _offlineRepo.updateDownloadStatus(item.id, 3, error: reason);
+    }
+  }
+
+  /// A retry re-queues the original quality with the usual permissions and
+  /// storage checks. It starts asynchronously, just like tapping Download
+  /// from a title detail page, without blocking the Failed tab for hours.
+  Future<void> retryFailedDownload(DownloadedItem failed) async {
+    final latest = await _offlineRepo.getItem(failed.itemId);
+    if (latest == null ||
+        latest.downloadStatus != 3 ||
+        latest.serverId != failed.serverId) {
+      return;
+    }
+    final progress = _activeDownloads[latest.itemId];
+    if (progress != null && progress.isInFlight) return;
+    unawaited(
+      downloadItem(
+        AggregatedItem(
+          id: latest.itemId,
+          serverId: latest.serverId,
+          rawData: _offlineRepo.rowToRawData(latest),
+        ),
+        quality: DownloadQuality.fromName(latest.qualityPreset),
+        source: DownloadSource.manual,
+      ).catchError((Object error, StackTrace stackTrace) {
+        debugPrint('[DownloadService] Retry failed: ${error.runtimeType}');
+      }),
+    );
+  }
+
+  /// Remove the failure record only. A failed attempt may share a film folder
+  /// with valid downloads, so never recursively delete a media directory.
+  Future<void> removeFailedDownload(DownloadedItem failed) async {
+    final latest = await _offlineRepo.getItem(failed.itemId);
+    if (latest == null ||
+        latest.downloadStatus != 3 ||
+        latest.serverId != failed.serverId) {
+      return;
+    }
+    final progress = _activeDownloads[latest.itemId];
+    if (progress != null && progress.isInFlight) return;
+    await _offlineRepo.deleteItem(latest.itemId);
+    _activeDownloads.remove(latest.itemId);
+    _sources.remove(latest.itemId);
+    notifyListeners();
+  }
 
   String _fileNameBaseFromPath(String savePath) {
     return p.basenameWithoutExtension(savePath);
@@ -1434,6 +1521,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
         type: DioExceptionType.unknown,
         requestOptions: RequestOptions(path: url),
         message: friendlyDownloadFailure(e.message),
+        error: e,
       );
     }
   }
@@ -2164,6 +2252,28 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
     return '$baseUrl/Videos/$itemId/stream?$query';
   }
 
+  /// Ask Emby for the same H.264/AAC HLS offer used for ordinary playback.
+  /// The server supplies the actual playlist URL and audio-track parameters.
+  /// This is only attempted after an Android Media3 transcode export fails.
+  Future<String?> _embyHlsDownloadUrl(
+    AggregatedItem item,
+    DownloadQuality quality,
+  ) async {
+    final playbackInfo = await _client.playbackApi.getPlaybackInfo(
+      item.id,
+      userId: _client.userId,
+      requestBody: EmbyHlsDownloadFallback.playbackRequest(
+        quality: quality,
+        userId: _client.userId,
+      ),
+    );
+    return EmbyHlsDownloadFallback.streamUrl(
+      playbackInfo,
+      baseUrl: _client.baseUrl,
+      quality: quality,
+    );
+  }
+
   Future<AggregatedItem> _ensureFullItem(AggregatedItem item) async {
     // Items from row queries are missing fields like Overview and Chapters,
     // so always fetch the full item before persisting its metadata. This copy
@@ -2306,6 +2416,10 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
     var activityResumeTicks = 0;
 
     if (!await _checkWifiPolicy()) {
+      await _persistFailedDownload(
+        item, quality, source,
+        'WiFi-only mode enabled. Connect to WiFi to download.',
+      );
       _activeDownloads[item.id] = DownloadProgress(
         itemId: item.id,
         fileName: item.name,
@@ -2326,6 +2440,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
       final estimatedSize = estimateDownloadSizeBytes(fullItem, quality);
       final refusal = await _storageRefusal(estimatedSize);
       if (refusal != null) {
+        await _persistFailedDownload(fullItem, quality, source, refusal);
         _activeDownloads[item.id] = DownloadProgress(
           itemId: item.id,
           fileName: item.name,
@@ -2349,6 +2464,9 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
               'Not enough free space in ${downloadsDir.path}. '
               'Needs about ${formatBytes(estimatedSize + _freeSpaceHeadroomBytes)}, '
               '${formatBytes(free)} available.';
+          await _persistFailedDownload(
+            fullItem, quality, source, message,
+          );
           _activeDownloads[item.id] = DownloadProgress(
             itemId: item.id,
             fileName: item.name,
@@ -2558,6 +2676,41 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
               cancelToken: cancelToken,
               onReceiveProgress: onReceiveProgress,
             );
+          } on DioException catch (firstError) {
+            // The ordinary HEVC fragmented-MP4 path can fail inside the
+            // Android muxer even when Emby can stream H.264 HLS. Retry once
+            // with Emby's own playback URL rather than downloading 4K source.
+            // Don't retry a server/network error or an explicit cancellation.
+            final nativeError = firstError.error;
+            if (_client.serverType != ServerType.emby ||
+                nativeError is! TransmuxFailedException ||
+                !nativeError.isMuxerFailure ||
+                cancelToken.isCancelled) {
+              rethrow;
+            }
+            String? hlsUrl;
+            try {
+              hlsUrl = await _embyHlsDownloadUrl(fullItem, quality);
+            } catch (e) {
+              // Avoid logging server URLs or tokens from a playback error.
+              debugPrint('Emby HLS download fallback unavailable: ${e.runtimeType}');
+            }
+            if (hlsUrl == null) rethrow;
+            final partial = File(savePath!);
+            if (await partial.exists()) await partial.delete();
+            debugPrint('Retrying failed Android transmux with Emby HLS');
+            try {
+              return await _downloadWithTransmux(
+                hlsUrl,
+                itemId: item.id,
+                savePath: savePath!,
+                headers: headers,
+                cancelToken: cancelToken,
+                onReceiveProgress: onReceiveProgress,
+              );
+            } on TransmuxUnavailableException {
+              throw firstError;
+            }
           } on TransmuxUnavailableException {
             // The native side refused this one (busy, missing, or an old
             // device). The regular engines still produce a playable file.
@@ -2719,11 +2872,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
           error: friendlyError,
           quality: quality,
         );
-        await _offlineRepo.updateDownloadStatus(
-          item.id,
-          3,
-          error: friendlyError,
-        );
+        await _persistFailedDownload(item, quality, source, friendlyError);
         if (!pluginOwnsNotifications()) {
           await _notifyDownloadError(item.name, friendlyError);
         }
@@ -2740,7 +2889,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
         error: friendlyError,
         quality: quality,
       );
-      await _offlineRepo.updateDownloadStatus(item.id, 3, error: friendlyError);
+      await _persistFailedDownload(item, quality, source, friendlyError);
       if (!pluginOwnsNotifications()) {
         await _notifyDownloadError(item.name, friendlyError);
       }
@@ -2760,7 +2909,7 @@ class DownloadService extends ChangeNotifier implements AutoDownloadDownloader {
         error: friendlyError,
         quality: quality,
       );
-      await _offlineRepo.updateDownloadStatus(item.id, 3, error: friendlyError);
+      await _persistFailedDownload(item, quality, source, friendlyError);
       if (!pluginOwnsNotifications()) {
         await _notifyDownloadError(item.name, friendlyError);
       }

@@ -21,6 +21,7 @@ import '../../widgets/sync_indicator.dart';
 import '../settings/download_settings_screen.dart';
 import 'saved_show_screen.dart';
 import 'widgets/active_downloads_tab.dart';
+import 'widgets/failed_downloads_tab.dart';
 import 'widgets/saved_media_actions.dart';
 import 'widgets/saved_media_menu.dart';
 import 'widgets/saved_media_row.dart';
@@ -30,11 +31,17 @@ enum SavedMediaSort { size, name, dateAdded }
 
 /// One tab and the rows behind it, built only when the tab is the open one.
 class _SavedTab {
-  const _SavedTab(this.label, this.rows, {this.isActiveDownloads = false});
+  const _SavedTab(
+    this.label,
+    this.rows, {
+    this.isActiveDownloads = false,
+    this.isFailedDownloads = false,
+  });
 
   final String label;
   final List<DownloadGroup> Function() rows;
   final bool isActiveDownloads;
+  final bool isFailedDownloads;
 }
 
 /// The saved media list: what is on the device, grouped, filtered and playable
@@ -99,7 +106,7 @@ class _DownloadsHomeState extends ConsumerState<DownloadsHome> {
   ///
   /// Each tab builds its rows on demand, because only the open one is ever
   /// shown and sorting the rest on every rebuild buys nothing.
-  List<_SavedTab> _buildTabs(AppLocalizations l10n, List<DownloadedItem> items) {
+  List<_SavedTab> _buildTabs(AppLocalizations l10n, List<DownloadedItem> items, int failedCount) {
     List<DownloadGroup> standalone(bool Function(DownloadedItem) test) => _sorted([
       for (final item in items)
         if (test(item))
@@ -140,6 +147,11 @@ class _DownloadsHomeState extends ConsumerState<DownloadsHome> {
       if (types.contains('Book'))
         _SavedTab(l10n.books, () => standalone((item) => item.type == 'Book')),
       _SavedTab(l10n.activeDownloads, () => const [], isActiveDownloads: true),
+      _SavedTab(
+        failedCount > 0 ? '${l10n.failedStatus} ($failedCount)' : l10n.failedStatus,
+        () => const [],
+        isFailedDownloads: true,
+      ),
     ];
   }
 
@@ -199,10 +211,14 @@ class _DownloadsHomeState extends ConsumerState<DownloadsHome> {
         .watch(userPreferencesProvider)
         .get(UserPreferences.downloadStorageLimitMb);
 
-    final tabs = _buildTabs(l10n, catalog.items);
+    final failedCount = ref.watch(failedDownloadsProvider).maybeWhen(
+      data: (rows) => rows.length,
+      orElse: () => 0,
+    );
+    final tabs = _buildTabs(l10n, catalog.items, failedCount);
     final tabIndex = _tab.clamp(0, tabs.length - 1);
     final current = tabs[tabIndex];
-    final groups = current.isActiveDownloads
+    final groups = current.isActiveDownloads || current.isFailedDownloads
         ? const <DownloadGroup>[]
         : _filtered(current.rows());
 
@@ -262,7 +278,9 @@ class _DownloadsHomeState extends ConsumerState<DownloadsHome> {
                             ? _initialFocusNode
                             : null,
                       )
-                    : _list(l10n, groups, catalog.containerArtwork),
+                    : current.isFailedDownloads
+                        ? FailedDownloadsTab(query: _query)
+                        : _list(l10n, groups, catalog.containerArtwork),
               ),
               if (_selectMode && _selected.isNotEmpty) _selectionBar(l10n),
             ],

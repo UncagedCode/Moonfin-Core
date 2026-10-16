@@ -42,6 +42,19 @@ void main() {
     });
   });
 
+  test('only Media3 muxer errors qualify for the HLS fallback', () {
+    expect(const TransmuxFailedException('Muxer error', 7001).isMuxerFailure,
+        isTrue);
+    expect(const TransmuxFailedException('watchdog', 7002).isMuxerFailure,
+        isTrue);
+    expect(const TransmuxFailedException('append', 7003).isMuxerFailure,
+        isTrue);
+    expect(const TransmuxFailedException('network', 2001).isMuxerFailure,
+        isFalse);
+    expect(const TransmuxFailedException('decoder', 3003).isMuxerFailure,
+        isFalse);
+  });
+
   group('start', () {
     final calls = <MethodCall>[];
 

@@ -40,6 +40,13 @@ class TransmuxFailedException implements Exception {
   final int errorCode;
   const TransmuxFailedException(this.message, this.errorCode);
 
+  /// Media3 export codes 7001/7002/7003 are muxer failures, including a
+  /// watchdog timeout. Other errors (network, codec, permissions) shouldn't
+  /// trigger a second server-side conversion.
+  bool get isMuxerFailure =>
+      (errorCode >= 7001 && errorCode <= 7003) ||
+      message.toLowerCase().contains('muxer error');
+
   @override
   String toString() => 'TransmuxFailedException($errorCode): $message';
 }
