@@ -101,7 +101,7 @@ class _DownloadsHomeState extends ConsumerState<DownloadsHome> {
   ///
   /// Each tab builds its rows on demand, because only the open one is ever
   /// shown and sorting the rest on every rebuild buys nothing.
-  List<_SavedTab> _buildTabs(AppLocalizations l10n, List<DownloadedItem> items) {
+  List<_SavedTab> _buildTabs(AppLocalizations l10n, List<DownloadedItem> items, int failedCount) {
     List<DownloadGroup> standalone(bool Function(DownloadedItem) test) => _sorted([
       for (final item in items)
         if (test(item))
@@ -142,7 +142,11 @@ class _DownloadsHomeState extends ConsumerState<DownloadsHome> {
       if (types.contains('Book'))
         _SavedTab(l10n.books, () => standalone((item) => item.type == 'Book')),
       _SavedTab(l10n.activeDownloads, () => const [], isActiveDownloads: true),
-      _SavedTab('Failed', () => const [], isFailedDownloads: true),
+      _SavedTab(
+        failedCount > 0 ? '${l10n.failedStatus} ($failedCount)' : l10n.failedStatus,
+        () => const [],
+        isFailedDownloads: true,
+      ),
     ];
   }
 
@@ -202,7 +206,11 @@ class _DownloadsHomeState extends ConsumerState<DownloadsHome> {
         .watch(userPreferencesProvider)
         .get(UserPreferences.downloadStorageLimitMb);
 
-    final tabs = _buildTabs(l10n, catalog.items);
+    final failedCount = ref.watch(failedDownloadsProvider).maybeWhen(
+      data: (rows) => rows.length,
+      orElse: () => 0,
+    );
+    final tabs = _buildTabs(l10n, catalog.items, failedCount);
     final tabIndex = _tab.clamp(0, tabs.length - 1);
     final current = tabs[tabIndex];
     final groups = current.isActiveDownloads || current.isFailedDownloads
