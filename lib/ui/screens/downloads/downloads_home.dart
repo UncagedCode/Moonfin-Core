@@ -31,7 +31,12 @@ enum SavedMediaSort { size, name, dateAdded }
 
 /// One tab and the rows behind it, built only when the tab is the open one.
 class _SavedTab {
-  const _SavedTab(this.label, this.rows, {this.isActiveDownloads = false, this.isFailedDownloads = false});
+  const _SavedTab(
+    this.label,
+    this.rows, {
+    this.isActiveDownloads = false,
+    this.isFailedDownloads = false,
+  });
 
   final String label;
   final List<DownloadGroup> Function() rows;
