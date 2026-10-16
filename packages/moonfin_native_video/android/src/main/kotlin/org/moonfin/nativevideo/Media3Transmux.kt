@@ -5,6 +5,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.Clock
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
@@ -203,7 +204,9 @@ object Media3Transmux {
                     emitEvent(
                         transmuxErrorEvent(
                             taskId = job.taskId,
-                            message = exportException.message ?: "Transmux failed",
+                            message = "${exportException.message ?: "Transmux failed"} " +
+                                "(Media3 code ${exportException.errorCode}, " +
+                                "cause ${exportException.cause?.javaClass?.simpleName ?: "unknown"})",
                             errorCode = exportException.errorCode,
                         ),
                     )
@@ -213,7 +216,18 @@ object Media3Transmux {
 
         val job = ActiveJob(args.taskId, transformer, outputFile)
         try {
-            transformer.start(MediaItem.fromUri(args.url), args.outputPath)
+            // A server-supplied HLS playlist needs explicit MIME in case a
+            // reverse proxy rewrites the URL extension or response headers.
+            // Media3's HLS module is already bundled by this plugin.
+            val mediaItem = MediaItem.Builder()
+                .setUri(args.url)
+                .apply {
+                    if (args.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) {
+                        setMimeType(MimeTypes.APPLICATION_M3U8)
+                    }
+                }
+                .build()
+            transformer.start(mediaItem, args.outputPath)
         } catch (e: Exception) {
             outputFile.delete()
             result.error("TRANSMUX_START_FAILED", e.message, null)
