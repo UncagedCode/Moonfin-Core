@@ -4,6 +4,8 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.Clock
@@ -87,6 +89,12 @@ internal fun transmuxCancelledEvent(taskId: String): Map<String, Any?> =
  */
 @UnstableApi
 object Media3Transmux {
+    // Media3's default muxer watchdog times out after a brief gap in samples.
+    // A real-time server transcode can pause without being broken. Once that
+    // watchdog is disabled below, this independent, longer guard still stops
+    // tasks that have stopped writing anything at all.
+    private const val MAX_OUTPUT_IDLE_MS = 6L * 60L * 1000L
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private var eventSink: EventChannel.EventSink? = null
 
@@ -95,6 +103,8 @@ object Media3Transmux {
         val transformer: Transformer,
         val outputFile: File,
         var progressRunnable: Runnable? = null,
+        var lastBytesWritten: Long = 0,
+        var lastOutputAtMs: Long = SystemClock.elapsedRealtime(),
     )
 
     private var active: ActiveJob? = null
@@ -178,6 +188,11 @@ object Media3Transmux {
 
         val transformer = Transformer.Builder(context)
             .setAssetLoaderFactory(assetLoaderFactory)
+            // Android's official workaround for muxer code 7002 while exporting
+            // remote progressive media: a slow server may take longer than the
+            // default inter-sample window. HTTP read timeout still applies,
+            // and our separate output-idle guard prevents indefinite stalls.
+            .setMaxDelayBetweenMuxerSamplesMs(C.TIME_UNSET)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                     val job = active?.takeIf { it.taskId == args.taskId } ?: return
@@ -254,7 +269,30 @@ object Media3Transmux {
     private fun startProgress(job: ActiveJob) {
         val runnable = object : Runnable {
             override fun run() {
-                emitEvent(transmuxProgressEvent(job.taskId, job.outputFile.length()))
+                // A server that is still encoding should not be killed merely
+                // because Media3 had no new samples for a few seconds. Stop
+                // after a much longer period without ANY output growth.
+                if (active !== job) return
+                val bytes = job.outputFile.length()
+                val now = SystemClock.elapsedRealtime()
+                if (bytes > job.lastBytesWritten) {
+                    job.lastBytesWritten = bytes
+                    job.lastOutputAtMs = now
+                } else if (now - job.lastOutputAtMs >= MAX_OUTPUT_IDLE_MS) {
+                    stopProgress(job)
+                    active = null
+                    job.transformer.cancel()
+                    job.outputFile.delete()
+                    emitEvent(
+                        transmuxErrorEvent(
+                            job.taskId,
+                            "Transcode stalled: no output data for six minutes",
+                            ExportException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+                        ),
+                    )
+                    return
+                }
+                emitEvent(transmuxProgressEvent(job.taskId, bytes))
                 mainHandler.postDelayed(this, 500L)
             }
         }
