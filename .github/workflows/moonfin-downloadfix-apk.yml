@@ -9,6 +9,11 @@ on:
       - fix/android-emby-transcoded-downloads
     paths:
       - .github/workflows/moonfin-downloadfix-apk.yml
+      - lib/data/services/**
+      - lib/data/providers/offline_providers.dart
+      - lib/ui/screens/downloads/**
+      - packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3Transmux.kt
+      - test/data/**
 
 permissions:
   contents: read
@@ -42,6 +47,12 @@ jobs:
 
       - name: Resolve Flutter dependencies
         run: flutter pub get
+
+      - name: Test download-fix regressions
+        run: |
+          flutter test test/data/services/media3_transmux_downloader_test.dart
+          flutter test test/data/services/emby_hls_download_fallback_test.dart
+          flutter test test/data/failed_downloads_test.dart
 
       - name: Build separate arm64 Android APK
         run: |
